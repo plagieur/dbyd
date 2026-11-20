@@ -54,6 +54,7 @@ icons! {
     Message => "message",
     Image => "image",
     PlusCircle => "plus_circle",
+    Members => "members",
 }
 
 pub const DEFAULT_PACK: &str = "Default";

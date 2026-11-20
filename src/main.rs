@@ -1,4 +1,5 @@
 mod backend;
+mod badges;
 mod cursor;
 mod format;
 mod icons;
@@ -7,7 +8,7 @@ mod settings;
 mod theme;
 mod voice;
 
-use backend::{Channel, ChannelKind, Command, Emoji, Event, GifItem, Guild, Message, Profile, Upload};
+use backend::{Card, Channel, ChannelKind, Command, Emoji, Event, GifItem, Guild, GuildMember, Message, Presence, Profile, Upload};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use eframe::egui::{self, Margin, RichText, Sense, Stroke, vec2};
 use serde::{Deserialize, Serialize};
@@ -27,6 +28,51 @@ const MAX_IMAGE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_UPLOAD_BYTES: u64 = 25 * 1024 * 1024;
 
 const UNICODE_EMOJIS: &str = "😀😁😂🤣😊😍😘😎🤔😅😭😡🥺😴🙄😏👍👎👏🙏💪🤝👀🔥✨⭐💯🎉🎂❤️💔💙💚💛🧡💜🖤🤍✅❌⚠️❓❗💀👻🤖🎮🎵🎧📷🎬🍕🍔🍟🍺☕🐱🐶🦊🐸🌈🌙☀️⚡🚀";
+
+/// A member of the list: picture with a status dot, name, and what they are doing.
+fn member_row(ui: &mut egui::Ui, member: &GuildMember) -> bool {
+    let width = ui.available_width();
+    let (rect, response) = ui.allocate_exact_size(vec2(width, 46.0), Sense::click());
+    if response.hovered() {
+        ui.painter().rect_filled(rect, 4.0, hover());
+    }
+    let offline = member.presence == Presence::Offline;
+    let picture_rect = egui::Rect::from_min_size(rect.min + vec2(6.0, 7.0), vec2(32.0, 32.0));
+    let mut picture = egui::Image::new(member.avatar.clone()).corner_radius(16.0);
+    if offline {
+        picture = picture.tint(egui::Color32::from_white_alpha(110));
+    }
+    picture.paint_at(ui, picture_rect);
+    let status = match member.presence {
+        Presence::Online => egui::Color32::from_rgb(35, 165, 90),
+        Presence::Idle => egui::Color32::from_rgb(240, 178, 50),
+        Presence::DoNotDisturb => egui::Color32::from_rgb(242, 63, 67),
+        Presence::Offline => dim(),
+    };
+    let dot = picture_rect.right_bottom() - vec2(3.0, 3.0);
+    ui.painter().circle_filled(dot, 7.0, sidebar());
+    ui.painter().circle_filled(dot, 4.5, status);
+
+    let painter = ui.painter_at(rect);
+    let x = picture_rect.right() + 10.0;
+    let name_color = if offline { dim() } else { ink() };
+    let name = if member.bot { format!("{}  BOT", member.name) } else { member.name.clone() };
+    match &member.activity {
+        Some(activity) => {
+            painter.text(egui::pos2(x, rect.center().y - 8.0), egui::Align2::LEFT_CENTER, name, egui::FontId::proportional(14.0), name_color);
+            painter.text(egui::pos2(x, rect.center().y + 9.0), egui::Align2::LEFT_CENTER, activity, egui::FontId::proportional(11.5), muted());
+        }
+        None => {
+            painter.text(egui::pos2(x, rect.center().y), egui::Align2::LEFT_CENTER, name, egui::FontId::proportional(14.0), name_color);
+        }
+    }
+    response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+}
+
+enum MemberRow {
+    Header(String),
+    Member(u64),
+}
 
 enum Screen {
     Login,
@@ -77,6 +123,12 @@ struct App {
     replying: Option<(u64, String)>,
     /// The message being edited (id, original text): the message box then edits it instead of sending.
     editing: Option<(u64, String)>,
+    members: HashMap<u64, GuildMember>,
+    member_rows: Vec<MemberRow>,
+    members_dirty: bool,
+    card: Option<Card>,
+    reconnect_needed: bool,
+    reconnect_note: Option<String>,
     emoji_open: bool,
     gif_open: bool,
     gif_query: String,
@@ -244,6 +296,12 @@ impl App {
             pending: Vec::new(),
             replying: None,
             editing: None,
+            members: HashMap::new(),
+            member_rows: Vec::new(),
+            members_dirty: false,
+            card: None,
+            reconnect_needed: false,
+            reconnect_note: None,
             emoji_open: false,
             gif_open: false,
             gif_query: String::new(),
@@ -278,6 +336,7 @@ impl App {
             self.error = Some("Paste the token of one of your bots.".into());
             return;
         }
+        let members = self.settings.members;
         let (event_tx, event_rx) = mpsc::channel();
         let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
         let ctx = ctx.clone();
@@ -285,7 +344,7 @@ impl App {
             let events = event_tx.clone();
             let repaint = ctx.clone();
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                backend::run(token, command_rx, event_tx, move || ctx.request_repaint())
+                backend::run(token, members, command_rx, event_tx, move || ctx.request_repaint())
             }));
             if result.is_err() {
                 let _ = events.send(Event::Error("The connection thread crashed. See the console for details.".into()));
@@ -309,6 +368,9 @@ impl App {
         self.pending.clear();
         self.replying = None;
         self.editing = None;
+        self.members.clear();
+        self.member_rows.clear();
+        self.card = None;
         self.voice = None;
         self.mic_muted = false;
         self.deafened = false;
@@ -433,6 +495,35 @@ impl App {
                             *old = message;
                         }
                     }
+                }
+                Event::Members { guild, members } => {
+                    if self.selected_guild == Some(guild) {
+                        for member in members {
+                            self.members.insert(member.id, member);
+                        }
+                        self.members_dirty = true;
+                    }
+                }
+                Event::PresenceChanged { guild, user, presence, activity } => {
+                    if self.selected_guild == Some(guild) {
+                        if let Some(member) = self.members.get_mut(&user) {
+                            member.presence = presence;
+                            member.activity = activity;
+                            self.members_dirty = true;
+                        }
+                    }
+                }
+                Event::MemberLeft { guild, user } => {
+                    if self.selected_guild == Some(guild) && self.members.remove(&user).is_some() {
+                        self.members_dirty = true;
+                    }
+                }
+                Event::Card(card) => self.card = Some(card),
+                Event::PrivilegedIntentsRefused => {
+                    self.settings.members = false;
+                    self.settings.save();
+                    self.reconnect_needed = true;
+                    self.reconnect_note = Some("Discord refused the member list: turn on \"Server Members Intent\" and \"Presence Intent\" for your bot in the developer portal (Bot page), then enable the member list again in the settings.".into());
                 }
                 Event::MessageDeleted { channel, id } => {
                     if self.selected_channel == Some(channel) {
@@ -744,6 +835,158 @@ impl App {
         ctx.memory_mut(|m| m.request_focus(id));
     }
 
+    /// Online members first, then offline ones, each group sorted by name.
+    fn rebuild_member_rows(&mut self) {
+        let mut online: Vec<&GuildMember> = self.members.values().filter(|m| m.presence != Presence::Offline).collect();
+        let mut offline: Vec<&GuildMember> = self.members.values().filter(|m| m.presence == Presence::Offline).collect();
+        online.sort_by_key(|m| m.name.to_lowercase());
+        offline.sort_by_key(|m| m.name.to_lowercase());
+        let mut rows = Vec::new();
+        if !online.is_empty() {
+            rows.push(MemberRow::Header(format!("ONLINE — {}", online.len())));
+            rows.extend(online.iter().map(|m| MemberRow::Member(m.id)));
+        }
+        if !offline.is_empty() {
+            rows.push(MemberRow::Header(format!("OFFLINE — {}", offline.len())));
+            rows.extend(offline.iter().map(|m| MemberRow::Member(m.id)));
+        }
+        self.member_rows = rows;
+        self.members_dirty = false;
+    }
+
+    fn reconnect(&mut self, ctx: &egui::Context) {
+        let note = self.reconnect_note.take();
+        self.disconnect();
+        self.connect(ctx);
+        self.notice = note;
+    }
+
+    /// The profile card of a member: picture, banner, badges, roles, seniority.
+    fn card_window(&mut self, ctx: &egui::Context) {
+        let Some(card) = self.card.clone() else { return };
+        let mut close = false;
+        let mut message = false;
+        let width = 360.0;
+        let frame = egui::Frame::new().fill(sidebar()).corner_radius(12.0).stroke(Stroke::new(1.0, line()));
+        egui::Window::new("member-card").title_bar(false).resizable(false).collapsible(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).fixed_size([width, 0.0]).frame(frame).show(ctx, |ui| {
+            ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
+            let (banner_rect, _) = ui.allocate_exact_size(vec2(width, 100.0), Sense::hover());
+            let top = egui::CornerRadius { nw: 12, ne: 12, sw: 0, se: 0 };
+            match &card.banner {
+                Some(url) => {
+                    let crop = egui::Rect::from_min_max(egui::pos2(0.0, 0.17), egui::pos2(1.0, 0.83));
+                    egui::Image::new(url.clone()).uv(crop).corner_radius(top).paint_at(ui, banner_rect);
+                }
+                None => {
+                    let color = card.accent.map(|c| egui::Color32::from_rgb((c >> 16) as u8, (c >> 8) as u8, c as u8)).unwrap_or(hover());
+                    ui.painter().rect_filled(banner_rect, top, color);
+                }
+            }
+            let mut corner = ui.new_child(egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(banner_rect.right_top() + vec2(-40.0, 6.0), vec2(34.0, 34.0))));
+            if icons::button(&mut corner, Icon::Close, "Close").clicked() {
+                close = true;
+            }
+            // the picture overlaps the banner, with the member's status
+            let picture = egui::Rect::from_min_size(banner_rect.left_bottom() + vec2(16.0, -40.0), vec2(80.0, 80.0));
+            ui.painter().circle_filled(picture.center(), 46.0, sidebar());
+            egui::Image::new(card.avatar.clone()).corner_radius(40.0).paint_at(ui, picture);
+            let known = self.members.get(&card.id);
+            if let Some(member) = known {
+                let status = match member.presence {
+                    Presence::Online => egui::Color32::from_rgb(35, 165, 90),
+                    Presence::Idle => egui::Color32::from_rgb(240, 178, 50),
+                    Presence::DoNotDisturb => egui::Color32::from_rgb(242, 63, 67),
+                    Presence::Offline => dim(),
+                };
+                let dot = picture.right_bottom() - vec2(8.0, 8.0);
+                ui.painter().circle_filled(dot, 11.0, sidebar());
+                ui.painter().circle_filled(dot, 7.5, status);
+            }
+            ui.add_space(46.0);
+
+            egui::Frame::new().inner_margin(Margin::symmetric(16, 0)).show(ui, |ui| {
+                ui.set_width(width - 32.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&card.name).size(20.0).strong());
+                    if card.bot {
+                        ui.label(RichText::new(" BOT ").size(10.0).color(ink()).background_color(dim()));
+                    }
+                });
+                ui.label(RichText::new(&card.username).size(13.0).color(muted()));
+                if !card.badges.is_empty() {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        for badge in &card.badges {
+                            match badge.url() {
+                                Some(url) => {
+                                    ui.add(egui::Image::new(url).fit_to_exact_size(vec2(22.0, 22.0))).on_hover_text(&badge.label);
+                                }
+                                None => {
+                                    ui.label(RichText::new(format!(" {} ", badge.label)).size(11.0).background_color(hover()));
+                                }
+                            }
+                        }
+                    });
+                }
+                if let Some(activity) = known.and_then(|m| m.activity.clone()) {
+                    ui.label(RichText::new(activity).size(13.0));
+                }
+                ui.add_space(2.0);
+                egui::Frame::new().fill(rail()).corner_radius(8.0).inner_margin(12.0).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    if let Some(joined) = card.joined {
+                        ui.label(RichText::new("Member of this server since").size(11.0).color(muted()));
+                        ui.label(messages::format_date(joined));
+                    }
+                    if let Some(since) = card.boosting_since {
+                        ui.label(RichText::new("Boosting this server since").size(11.0).color(muted()));
+                        ui.label(messages::format_date(since));
+                    }
+                    ui.label(RichText::new("On Discord since").size(11.0).color(muted()));
+                    ui.label(messages::format_date(card.created));
+                    if !card.roles.is_empty() {
+                        ui.add_space(4.0);
+                        ui.label(RichText::new("Roles").size(11.0).color(muted()));
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+                            for (name, color) in &card.roles {
+                                let dot = if *color == 0 { muted() } else { egui::Color32::from_rgb((*color >> 16) as u8, (*color >> 8) as u8, *color as u8) };
+                                egui::Frame::new().fill(input()).corner_radius(8.0).inner_margin(Margin::symmetric(8, 3)).show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 5.0;
+                                        let (rect, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
+                                        ui.painter().circle_filled(rect.center(), 5.0, dot);
+                                        ui.label(RichText::new(name).size(12.0));
+                                    });
+                                });
+                            }
+                        });
+                    }
+                });
+                ui.label(RichText::new("A bot can't see the \"About me\" text or anyone's Nitro subscription: the Nitro badge is a guess (animated picture or banner).").size(11.0).color(dim()));
+                ui.horizontal(|ui| {
+                    if card.id != self.bot_id && icons::menu_item(ui, Icon::Message, "Send a message").clicked() {
+                        message = true;
+                    }
+                    if icons::menu_item(ui, Icon::Copy, "Copy ID").clicked() {
+                        ui.ctx().copy_text(card.id.to_string());
+                    }
+                });
+            });
+            ui.add_space(12.0);
+        });
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            close = true;
+        }
+        if message {
+            self.send(Command::OpenDm(card.id));
+            close = true;
+        }
+        if close {
+            self.card = None;
+        }
+    }
+
     fn select_theme(&mut self, ctx: &egui::Context, name: &str) {
         if let Some(theme) = self.themes.iter().find(|t| t.name == name).cloned() {
             theme::set(theme.colors);
@@ -762,6 +1005,7 @@ impl App {
         let mut open_folder = false;
         let mut scale_done = false;
         let mut icons_changed = false;
+        let mut members_changed = false;
         let mut cursor_changed = false;
         let mut open_icons_dir = false;
         let mut open_cursors_dir = false;
@@ -779,6 +1023,12 @@ impl App {
             if slider.drag_stopped() || (slider.changed() && !slider.dragged()) {
                 scale_done = true;
             }
+            ui.add_space(8.0);
+            ui.label(RichText::new("Members").strong());
+            if ui.checkbox(&mut self.settings.members, "Show the member list").on_hover_text("Needs the Server Members and Presence intents turned on for your bot in the Discord developer portal (Bot page). DBYB reconnects when you change this.").changed() {
+                members_changed = true;
+            }
+            ui.label(RichText::new("Turn on \"Server Members Intent\" and \"Presence Intent\" for your bot first.").size(11.0).color(muted()));
             ui.add_space(8.0);
             ui.label(RichText::new("Icons").strong());
             egui::ComboBox::from_label("Icon pack").selected_text(self.settings.icon_pack.clone()).show_ui(ui, |ui| {
@@ -882,6 +1132,10 @@ impl App {
             ctx.set_zoom_factor(self.settings.scale);
             self.settings.save();
         }
+        if members_changed {
+            self.settings.save();
+            self.reconnect_needed = true;
+        }
         if icons_changed {
             icons::configure(&self.settings.icon_pack, self.settings.icon_size, self.settings.icon_color);
             self.settings.save();
@@ -954,7 +1208,7 @@ impl App {
         }
     }
 
-    fn message_list(&self, ui: &mut egui::Ui, open_dm: &mut Option<u64>, reply_to: &mut Option<(u64, String)>, delete: &mut Option<u64>, edit: &mut Option<(u64, String)>) {
+    fn message_list(&self, ui: &mut egui::Ui, open_dm: &mut Option<u64>, open_card: &mut Option<u64>, reply_to: &mut Option<(u64, String)>, delete: &mut Option<u64>, edit: &mut Option<(u64, String)>) {
         for (i, message) in self.messages.iter().enumerate() {
             let previous = i.checked_sub(1).and_then(|p| self.messages.get(p));
             let grouped = messages::continues(previous, message);
@@ -979,9 +1233,9 @@ impl App {
                                 ui.spacing_mut().item_spacing.x = 6.0;
                                 let author = ui.add(egui::Label::new(RichText::new(&message.author).strong()).sense(Sense::click()));
                                 if message.author_id != self.bot_id {
-                                    let author = author.on_hover_text("Click to send a DM").on_hover_cursor(egui::CursorIcon::PointingHand);
+                                    let author = author.on_hover_text("See the profile").on_hover_cursor(egui::CursorIcon::PointingHand);
                                     if author.clicked() {
-                                        *open_dm = Some(message.author_id);
+                                        *open_card = Some(message.author_id);
                                     }
                                 }
                                 if message.bot {
@@ -1035,6 +1289,10 @@ impl App {
                     *delete = Some(message.id);
                     ui.close();
                 }
+                if icons::menu_item(ui, Icon::User, "View profile").clicked() {
+                    *open_card = Some(message.author_id);
+                    ui.close();
+                }
                 if message.author_id != self.bot_id && icons::menu_item(ui, Icon::Message, "Send a DM").clicked() {
                     *open_dm = Some(message.author_id);
                     ui.close();
@@ -1050,6 +1308,8 @@ impl App {
         let mut pick_voice = None;
         let mut voice_action = None;
         let mut open_dm = None;
+        let mut open_card: Option<u64> = None;
+        let mut members_toggle = false;
         let mut logout = false;
         let mut open_profile = false;
         let mut add_files = false;
@@ -1152,8 +1412,54 @@ impl App {
             });
         });
 
+        // the member list, on the right, for server channels (when turned on in the settings)
+        if self.settings.members && self.settings.members_panel && !self.dm_mode && self.selected_guild.is_some() {
+            if self.members_dirty {
+                self.rebuild_member_rows();
+            }
+            egui::Panel::right("members").exact_size(240.0).resizable(false).frame(panel(sidebar(), Margin::symmetric(8, 12))).show(ui, |ui| {
+                if self.member_rows.is_empty() {
+                    ui.label(RichText::new("Loading the members...").size(12.0).color(muted()));
+                }
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, 46.0, self.member_rows.len(), |ui, range| {
+                    for row in &self.member_rows[range] {
+                        match row {
+                            MemberRow::Header(title) => {
+                                // same height as a member: the scroll area needs equal rows
+                                let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 46.0), Sense::hover());
+                                ui.painter_at(rect).text(egui::pos2(rect.left() + 6.0, rect.bottom() - 10.0), egui::Align2::LEFT_CENTER, title, egui::FontId::proportional(11.0), muted());
+                            }
+                            MemberRow::Member(id) => {
+                                if let Some(member) = self.members.get(id) {
+                                    if member_row(ui, member) {
+                                        open_card = Some(member.id);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+            });
+        }
+
         egui::Panel::top("chat-top").frame(panel(bg(), Margin::symmetric(16, 12)).stroke(Stroke::new(1.0, rail()))).show(ui, |ui| {
-            ui.label(RichText::new(self.channel_title()).strong().size(15.0));
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(self.channel_title()).strong().size(15.0));
+                    if !self.dm_mode && self.selected_guild.is_some() {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let tip = if !self.settings.members {
+                                "Turn on the member list"
+                            } else if self.settings.members_panel {
+                                "Hide the member list"
+                            } else {
+                                "Show the member list"
+                            };
+                            if icons::button(ui, Icon::Members, tip).clicked() {
+                                members_toggle = true;
+                            }
+                        });
+                    }
+                });
         });
 
         let mut to_send: Option<(String, Vec<Upload>)> = None;
@@ -1260,7 +1566,7 @@ impl App {
 
         egui::CentralPanel::no_frame().frame(panel(bg(), Margin::symmetric(16, 8))).show(ui, |ui| {
             egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
-                self.message_list(ui, &mut open_dm, &mut new_reply, &mut delete_id, &mut new_edit);
+                self.message_list(ui, &mut open_dm, &mut open_card, &mut new_reply, &mut delete_id, &mut new_edit);
             });
         });
 
@@ -1270,6 +1576,9 @@ impl App {
         }
         if self.settings_open {
             self.settings_window(&ctx);
+        }
+        if self.card.is_some() {
+            self.card_window(&ctx);
         }
         if self.gif_open {
             self.gif_window(&ctx);
@@ -1308,6 +1617,11 @@ impl App {
             self.channels.clear();
             self.messages.clear();
             self.send(Command::LoadChannels(id));
+            self.members.clear();
+            self.member_rows.clear();
+            if self.settings.members {
+                self.send(Command::LoadMembers(id));
+            }
         }
         if let (Some(text), Some((id, _)), Some(channel)) = (edit_done, self.editing.clone(), self.selected_channel) {
             self.send(Command::EditMessage { channel, id, text });
@@ -1321,6 +1635,23 @@ impl App {
         }
         if let Some(format) = format_pick {
             self.apply_format(&ctx, input_id, format);
+        }
+        if members_toggle {
+            if self.settings.members {
+                self.settings.members_panel = !self.settings.members_panel;
+            } else {
+                // first use: the member list needs the privileged intents, so DBYB reconnects with them
+                self.settings.members = true;
+                self.settings.members_panel = true;
+                self.reconnect_needed = true;
+                self.reconnect_note = Some("Member list turned on. It needs the Server Members and Presence intents enabled for your bot in the developer portal: DBYB will tell you if they are not.".into());
+            }
+            self.settings.save();
+        }
+        if let Some(user) = open_card {
+            self.card = None;
+            let guild = if self.dm_mode { None } else { self.selected_guild };
+            self.send(Command::LoadCard { guild, user });
         }
         if let (Some(id), Some(channel)) = (delete_id, self.selected_channel) {
             self.send(Command::DeleteMessage { channel, id });
@@ -1356,6 +1687,11 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll();
+        if self.reconnect_needed {
+            self.reconnect_needed = false;
+            let ctx = ui.ctx().clone();
+            self.reconnect(&ctx);
+        }
         match self.screen {
             Screen::Login | Screen::Connecting => self.login(ui),
             Screen::Chat => self.chat(ui),

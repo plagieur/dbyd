@@ -144,6 +144,72 @@ async fn klipy_gifs(web: &reqwest::Client, key: &str, query: &str) -> Result<Vec
         .collect())
 }
 
+/// How a member shows up on the member list.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Presence {
+    Online,
+    Idle,
+    DoNotDisturb,
+    Offline,
+}
+
+#[derive(Clone)]
+pub struct GuildMember {
+    pub id: u64,
+    pub name: String,
+    pub avatar: String,
+    pub bot: bool,
+    pub presence: Presence,
+    /// "Playing a game", "Listening to a song", or the custom status text.
+    pub activity: Option<String>,
+}
+
+fn presence_of(status: twilight_model::gateway::presence::Status) -> Presence {
+    use twilight_model::gateway::presence::Status;
+    match status {
+        Status::Online => Presence::Online,
+        Status::Idle => Presence::Idle,
+        Status::DoNotDisturb => Presence::DoNotDisturb,
+        _ => Presence::Offline,
+    }
+}
+
+/// The line shown under a member's name: what they play or listen to, otherwise their custom status.
+fn activity_text(activities: &[twilight_model::gateway::presence::Activity]) -> Option<String> {
+    use twilight_model::gateway::presence::ActivityType;
+    let described = activities.iter().find_map(|a| match a.kind {
+        ActivityType::Playing => Some(format!("Playing {}", a.name)),
+        ActivityType::Streaming => Some(format!("Streaming {}", a.name)),
+        ActivityType::Listening => Some(format!("Listening to {}", a.name)),
+        ActivityType::Watching => Some(format!("Watching {}", a.name)),
+        ActivityType::Competing => Some(format!("Competing in {}", a.name)),
+        _ => None,
+    });
+    described.or_else(|| activities.iter().find(|a| a.kind == ActivityType::Custom).and_then(|a| a.state.clone()))
+}
+
+/// A member's profile, as a bot can see it (a bot has no access to the "About me" text).
+#[derive(Clone)]
+pub struct Card {
+    pub id: u64,
+    /// Nickname on the server, otherwise display name.
+    pub name: String,
+    pub username: String,
+    pub avatar: String,
+    pub banner: Option<String>,
+    pub accent: Option<u32>,
+    pub bot: bool,
+    pub badges: Vec<crate::badges::Badge>,
+    /// When the user joined this server (unix seconds).
+    pub joined: Option<i64>,
+    /// Since when the user boosts this server (unix seconds).
+    pub boosting_since: Option<i64>,
+    /// When the account was created (unix seconds).
+    pub created: i64,
+    /// Role names with their colour, highest first.
+    pub roles: Vec<(String, u32)>,
+}
+
 pub struct Upload {
     pub name: String,
     pub bytes: Vec<u8>,
@@ -159,6 +225,10 @@ pub enum Command {
     EditMessage { channel: u64, id: u64, text: String },
     /// Trending GIFs when `query` is empty, search results otherwise.
     Gifs { key: String, query: String },
+    /// Asks Discord for the members (and their presences) of a server. Needs the privileged intents.
+    LoadMembers(u64),
+    /// The profile card of a user, with their roles if guild is given.
+    LoadCard { guild: Option<u64>, user: u64 },
     /// Tells Klipy a GIF was sent (their usage rules ask for it).
     GifShared { key: String, slug: String },
     JoinVoice { guild: u64, channel: u64 },
@@ -173,6 +243,13 @@ pub enum Event {
     Channels { guild: u64, channels: Vec<Channel> },
     Emojis { guild: u64, emojis: Vec<Emoji> },
     Gifs { query: String, items: Vec<GifItem> },
+    /// Members of a server (a chunk of them, or one who just joined).
+    Members { guild: u64, members: Vec<GuildMember> },
+    PresenceChanged { guild: u64, user: u64, presence: Presence, activity: Option<String> },
+    MemberLeft { guild: u64, user: u64 },
+    /// Discord refused the privileged intents: they are not turned on for this bot in the developer portal.
+    PrivilegedIntentsRefused,
+    Card(Card),
     Messages { channel: u64, messages: Vec<Message> },
     /// `is_dm` is true when the message was sent in a direct message channel.
     NewMessage { channel: u64, message: Message, is_dm: bool },
@@ -317,7 +394,7 @@ fn convert(m: &twilight_model::channel::Message) -> Message {
 }
 
 /// Runs until the UI side is dropped. Blocking: call it from a dedicated thread.
-pub fn run(token: String, commands: UnboundedReceiver<Command>, events: Sender<Event>, repaint: impl Fn() + Send + Sync + 'static) {
+pub fn run(token: String, members: bool, commands: UnboundedReceiver<Command>, events: Sender<Event>, repaint: impl Fn() + Send + Sync + 'static) {
     let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().worker_threads(2).build() {
         Ok(r) => r,
         Err(e) => {
@@ -358,21 +435,84 @@ pub fn run(token: String, commands: UnboundedReceiver<Command>, events: Sender<E
         });
 
         // incoming messages (needs the "Message Content" intent enabled in the developer portal)
-        let intents = Intents::GUILDS | Intents::GUILD_MESSAGES | Intents::DIRECT_MESSAGES | Intents::MESSAGE_CONTENT | Intents::GUILD_VOICE_STATES;
+        let mut intents = Intents::GUILDS | Intents::GUILD_MESSAGES | Intents::DIRECT_MESSAGES | Intents::MESSAGE_CONTENT | Intents::GUILD_VOICE_STATES;
+        if members {
+            // privileged: they must be turned on for the bot in the developer portal
+            intents |= Intents::GUILD_MEMBERS | Intents::GUILD_PRESENCES;
+        }
         let mut shard = Shard::new(ShardId::ONE, token, intents);
+        let member_sender = shard.sender();
         let shards = HashMap::from([(shard.id().number(), shard.sender())]);
         let user_id: Id<UserMarker> = id(profile_id).expect("the bot has an ID");
         let songbird = Arc::new(Songbird::twilight_from_config(Arc::new(TwilightMap::new(shards)), user_id, SongbirdConfig::default().decode_mode(DecodeMode::Decode(DecodeConfig::default()))));
         let live = {
             let (events, repaint, songbird) = (events.clone(), repaint.clone(), songbird.clone());
             tokio::spawn(async move {
-                let wanted = EventTypeFlags::MESSAGE_CREATE | EventTypeFlags::MESSAGE_UPDATE | EventTypeFlags::MESSAGE_DELETE | EventTypeFlags::VOICE_STATE_UPDATE | EventTypeFlags::VOICE_SERVER_UPDATE;
+                let wanted = EventTypeFlags::MESSAGE_CREATE | EventTypeFlags::MESSAGE_UPDATE | EventTypeFlags::MESSAGE_DELETE | EventTypeFlags::MEMBER_CHUNK | EventTypeFlags::MEMBER_ADD | EventTypeFlags::MEMBER_REMOVE | EventTypeFlags::PRESENCE_UPDATE | EventTypeFlags::VOICE_STATE_UPDATE | EventTypeFlags::VOICE_SERVER_UPDATE;
                 while let Some(item) = shard.next_event(wanted).await {
                     let Ok(event) = item else { continue };
                     songbird.process(&event).await;
                     match event {
                         GatewayEvent::MessageCreate(m) => {
                             let _ = events.send(Event::NewMessage { channel: m.channel_id.get(), message: convert(&m), is_dm: m.guild_id.is_none() });
+                            repaint();
+                        }
+                        GatewayEvent::GatewayClose(Some(frame)) if matches!(frame.code, 4013 | 4014) => {
+                            let _ = events.send(Event::PrivilegedIntentsRefused);
+                            repaint();
+                        }
+                        GatewayEvent::MemberChunk(chunk) => {
+                            let states: HashMap<u64, (Presence, Option<String>)> = chunk
+                                .presences
+                                .iter()
+                                .map(|p| {
+                                    let user = match &p.user {
+                                        twilight_model::gateway::presence::UserOrId::User(u) => u.id.get(),
+                                        twilight_model::gateway::presence::UserOrId::UserId { id } => id.get(),
+                                    };
+                                    (user, (presence_of(p.status), activity_text(&p.activities)))
+                                })
+                                .collect();
+                            let members = chunk
+                                .members
+                                .iter()
+                                .map(|m| {
+                                    let (presence, activity) = states.get(&m.user.id.get()).cloned().unwrap_or((Presence::Offline, None));
+                                    GuildMember {
+                                        id: m.user.id.get(),
+                                        name: m.nick.clone().or_else(|| m.user.global_name.clone()).unwrap_or_else(|| m.user.name.clone()),
+                                        avatar: avatar_url(m.user.id, m.user.avatar.as_ref(), 64),
+                                        bot: m.user.bot,
+                                        presence,
+                                        activity,
+                                    }
+                                })
+                                .collect();
+                            let _ = events.send(Event::Members { guild: chunk.guild_id.get(), members });
+                            repaint();
+                        }
+                        GatewayEvent::PresenceUpdate(p) => {
+                            let user = match &p.user {
+                                twilight_model::gateway::presence::UserOrId::User(u) => u.id.get(),
+                                twilight_model::gateway::presence::UserOrId::UserId { id } => id.get(),
+                            };
+                            let _ = events.send(Event::PresenceChanged { guild: p.guild_id.get(), user, presence: presence_of(p.status), activity: activity_text(&p.activities) });
+                            repaint();
+                        }
+                        GatewayEvent::MemberRemove(m) => {
+                            let _ = events.send(Event::MemberLeft { guild: m.guild_id.get(), user: m.user.id.get() });
+                            repaint();
+                        }
+                        GatewayEvent::MemberAdd(m) => {
+                            let member = GuildMember {
+                                id: m.user.id.get(),
+                                name: m.nick.clone().or_else(|| m.user.global_name.clone()).unwrap_or_else(|| m.user.name.clone()),
+                                avatar: avatar_url(m.user.id, m.user.avatar.as_ref(), 64),
+                                bot: m.user.bot,
+                                presence: Presence::Offline,
+                                activity: None,
+                            };
+                            let _ = events.send(Event::Members { guild: m.guild_id.get(), members: vec![member] });
                             repaint();
                         }
                         GatewayEvent::MessageDelete(m) => {
@@ -389,6 +529,7 @@ pub fn run(token: String, commands: UnboundedReceiver<Command>, events: Sender<E
             })
         };
         let mut voice: Option<VoiceSession> = None;
+        let mut role_cache: HashMap<u64, Vec<(u64, String, u32, i64)>> = HashMap::new();
         let web = reqwest::Client::builder().timeout(std::time::Duration::from_secs(15)).user_agent("DBYB").build().expect("HTTP client");
 
         let handle_commands = async {
@@ -478,6 +619,68 @@ pub fn run(token: String, commands: UnboundedReceiver<Command>, events: Sender<E
                             .json(&serde_json::json!({ "customer_id": format!("dbyb-{profile_id}") }))
                             .send()
                             .await;
+                    }
+                    Command::LoadCard { guild, user } => {
+                        let Some(uid) = id::<UserMarker>(user) else { continue };
+                        let who = match http.user(uid).await {
+                            Ok(r) => r.model().await.ok(),
+                            Err(_) => None,
+                        };
+                        let Some(who) = who else {
+                            send(Event::Error("Cannot load this profile.".into()));
+                            continue;
+                        };
+                        let (mut joined, mut nick, mut roles, mut boosting_since) = (None, None, Vec::new(), None);
+                        if let Some(gid) = guild.and_then(id::<GuildMarker>) {
+                            if !role_cache.contains_key(&guild.unwrap_or(0)) {
+                                if let Ok(r) = http.roles(gid).await {
+                                    let all = r.models().await.unwrap_or_default().into_iter().map(|role| (role.id.get(), role.name, role.colors.primary_color, role.position)).collect();
+                                    role_cache.insert(gid.get(), all);
+                                }
+                            }
+                            if let Ok(r) = http.guild_member(gid, uid).await {
+                                if let Ok(member) = r.model().await {
+                                    joined = member.joined_at.map(|t| t.as_secs());
+                                    nick = member.nick.clone();
+                                    boosting_since = member.premium_since.map(|t| t.as_secs());
+                                    let known = role_cache.get(&gid.get());
+                                    let mut found: Vec<(i64, String, u32)> = member.roles.iter().filter_map(|rid| known?.iter().find(|(id, ..)| *id == rid.get())).map(|(_, name, color, position)| (*position, name.clone(), *color)).collect();
+                                    found.sort_by_key(|(position, ..)| std::cmp::Reverse(*position));
+                                    roles = found.into_iter().map(|(_, name, color)| (name, color)).collect();
+                                }
+                            }
+                        }
+                        send(Event::Card(Card {
+                            id: who.id.get(),
+                            name: nick.or_else(|| who.global_name.clone()).unwrap_or_else(|| who.name.clone()),
+                            username: who.name.clone(),
+                            avatar: avatar_url(who.id, who.avatar.as_ref(), 256),
+                            banner: who.banner.as_ref().map(|hash| format!("https://cdn.discordapp.com/banners/{}/{hash}.png?size=480", who.id)),
+                            accent: who.accent_color,
+                            bot: who.bot,
+                            badges: {
+                                let mut badges = crate::badges::from_flags(who.public_flags.map(|f| f.bits() as u64).unwrap_or(0));
+                                // only Nitro allows an animated picture or a banner: a hint, not proof of a current subscription
+                                if who.banner.is_some() || who.avatar.as_ref().is_some_and(|hash| hash.is_animated()) {
+                                    badges.push(crate::badges::nitro());
+                                }
+                                if let Some(since) = boosting_since {
+                                    let months = ((chrono::Utc::now().timestamp() - since).max(0) as f64 / (30.44 * 86_400.0)) as u32;
+                                    badges.push(crate::badges::boost(months));
+                                }
+                                badges
+                            },
+                            joined,
+                            boosting_since,
+                            created: (((who.id.get() >> 22) + 1_420_070_400_000) / 1000) as i64,
+                            roles,
+                        }));
+                    }
+                    Command::LoadMembers(guild) => {
+                        if let (true, Some(gid)) = (members, id::<GuildMarker>(guild)) {
+                            let request = twilight_model::gateway::payload::outgoing::RequestGuildMembers::builder(gid).presences(true).query("", None);
+                            let _ = member_sender.command(&request);
+                        }
                     }
                     Command::JoinVoice { guild, channel } => {
                         let (Some(gid), Some(cid)) = (id::<GuildMarker>(guild), id::<ChannelMarker>(channel)) else { continue };

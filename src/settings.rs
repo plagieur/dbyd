@@ -19,11 +19,15 @@ pub struct Settings {
     /// "System" (the Windows cursor), a built-in style or a folder of the cursors folder.
     pub cursor_style: String,
     pub cursor_size: f32,
+    /// Show the member list (needs the privileged intents turned on for the bot).
+    pub members: bool,
+    /// Whether the member list is shown (the button in the top bar toggles it).
+    pub members_panel: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { theme: crate::theme::DEFAULT_THEME.into(), scale: 1.0, icon_pack: crate::icons::DEFAULT_PACK.into(), icon_size: 20.0, icon_color: None, cursor_style: crate::cursor::SYSTEM.into(), cursor_size: 28.0 }
+        Self { theme: crate::theme::DEFAULT_THEME.into(), scale: 1.0, icon_pack: crate::icons::DEFAULT_PACK.into(), icon_size: 20.0, icon_color: None, cursor_style: crate::cursor::SYSTEM.into(), cursor_size: 28.0, members: false, members_panel: true }
     }
 }
 
