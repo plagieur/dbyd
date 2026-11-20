@@ -917,9 +917,9 @@ impl App {
                     ui.horizontal_wrapped(|ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
                         for badge in &card.badges {
-                            match badge.url() {
-                                Some(url) => {
-                                    ui.add(egui::Image::new(url).fit_to_exact_size(vec2(22.0, 22.0))).on_hover_text(&badge.label);
+                            match badge.source() {
+                                Some(source) => {
+                                    ui.add(egui::Image::new(source).fit_to_exact_size(vec2(22.0, 22.0))).on_hover_text(&badge.label);
                                 }
                                 None => {
                                     ui.label(RichText::new(format!(" {} ", badge.label)).size(11.0).background_color(hover()));

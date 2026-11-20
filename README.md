@@ -28,7 +28,7 @@ A desktop Discord client, written in Rust, where you log in **as a bot** instead
 - **Member list** on the right of a server channel, like Discord: *Online* and *Offline* groups, each member with their picture, a **status dot** (online, idle, do not disturb, offline), a BOT tag, and what they are doing ("Playing…", "Listening to…", custom status). Statuses update live, and members who join or leave appear or disappear. Servers with thousands of members stay smooth.
 - The button at the top right of a server channel shows or hides the list. It needs the **Server Members** and **Presence** intents turned on for your bot (see Setup); DBYB tells you if they are not.
 - **Profile card**: click a member (in the list or by their name in the chat) to see their banner, picture and status, nickname and username, **badges**, role list with colours, when they joined the server, since when they are on Discord, and since when they boost the server. From the card you can send them a message or copy their ID.
-- **Badges** are Discord's own pictures, loaded from Discord's servers when needed (none is bundled): Staff, Partner, Moderator Programs Alumni, HypeSquad (Events, Bravery, Brilliance, Balance), Bug Hunter (gold), Early Supporter, Early Verified Bot Developer, Active Developer. The **server boost badge grows with time** (1, 2, 3, 6, 9, 12, 15, 18, 24 months). The Nitro badge is a guess, see Limits.
+- **Badges** are Discord's own pictures, loaded from Discord's servers when needed (only the first Bug Hunter level, which has no address we know, is shipped with DBYB): Staff, Partner, Moderator Programs Alumni, HypeSquad (Events, Bravery, Brilliance, Balance), Bug Hunter (gold), Early Supporter, Early Verified Bot Developer, Active Developer. The **server boost badge grows with time** (1, 2, 3, 6, 9, 12, 15, 18, 24 months). The Nitro badge is a guess, see Limits.
 
 **Profile and voice**
 - A Discord-style profile card to change the bot's own username, avatar, banner and bio.
@@ -69,7 +69,6 @@ What a bot can do is decided by Discord, not by this app:
 - No video, camera or screen sharing, and no calls in DMs: bots can only use server voice channels.
 - The member list and the statuses need two privileged intents, which you turn on yourself for your own bot.
 - A bot can't see another user's **"About me"** text, **Nitro subscription** (and so its level: Starter to Opal) or **boosts on other servers**. DBYB shows the Nitro badge when someone has an animated picture or a banner (only Nitro allows them), which is a hint and not proof. The boost badge only reflects the boost of the server you are looking at, so it is a minimum.
-- A few badge pictures are not known yet (the 3 and 24 month boost levels, and the first Bug Hunter level): they show as small text tags.
 - No reactions yet.
 - Changing a bot's username and images is rate-limited by Discord.
 - Windows only for now (the token is stored with the Windows credential store).
