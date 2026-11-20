@@ -5,6 +5,39 @@ A desktop Discord client, written in Rust, where you log in **as a bot** instead
 > [!IMPORTANT]
 > DBYB logs in with a **bot token**, through Discord's official API. Use it only with bots **you own** (or whose owner agrees). It is not a self-bot: it never touches a user account. It is an independent project, not affiliated with or endorsed by Discord.
 
+## Screenshots
+
+<table>
+<tr>
+<td align="center"><b>DBYB</b></td>
+<td align="center"><b>The same channel in the official Discord web client</b></td>
+</tr>
+<tr>
+<td><img src="docs/chat.png" alt="A channel in DBYB" width="360"></td>
+<td><img src="docs/discord-web.png" alt="The same channel in Discord" width="560"></td>
+</tr>
+</table>
+
+<table>
+<tr>
+<td align="center"><b>The bot's profile and status</b></td>
+<td align="center"><b>Settings: theme, icons, cursor</b></td>
+</tr>
+<tr>
+<td><img src="docs/profile.png" alt="Editing the bot's profile and status" width="340"></td>
+<td><img src="docs/settings.png" alt="The settings window" width="300"></td>
+</tr>
+</table>
+<table>
+<tr>
+<td align="center"><b>The member list, with statuses and activities</b></td>
+<td align="center"><b>Direct messages, with GIFs</b></td>
+</tr>
+<tr>
+<td><img src="docs/members.png" alt="The member list" width="200"></td>
+<td><img src="docs/dms.png" alt="Direct messages" width="560"></td>
+</tr>
+</table>
 ## Features
 
 **Chat**
