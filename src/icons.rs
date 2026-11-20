@@ -55,6 +55,8 @@ icons! {
     Image => "image",
     PlusCircle => "plus_circle",
     Members => "members",
+    Video => "video",
+    Screen => "monitor",
 }
 
 pub const DEFAULT_PACK: &str = "Default";

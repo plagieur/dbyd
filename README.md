@@ -8,11 +8,12 @@ A desktop Discord client, written in Rust, where you log in **as a bot** instead
 ## Features
 
 **Chat**
-- Servers with their icons, channels grouped by category, voice channels listed.
+- Servers with their icons, channels grouped by category, voice channels listed with **who is connected** under each one (their picture and name, a crossed microphone or headphones if they are muted or deafened, a camera icon if their camera is on, and a red **LIVE** tag if they are sharing their screen). It updates live.
 - Messages with avatars, timestamps, BOT badges, grouped messages, reply previews, embeds, `(edited)` marks and live updates (new, edited and deleted messages).
 - **Markdown** like Discord: `**bold**`, `*italic*`, `__underline__`, `~~strikethrough~~`, `||spoilers||`, `` `code` ``, code blocks, `> quotes`, `# headings`, clickable links, custom emojis and `@mentions`.
 - **Reply** to a message (button on hover, or right-click), with the quoted preview above the answer.
 - **Right-click a message**: reply, copy the text, link or ID, send a DM to its author, and for the bot's own messages **edit** and **delete**.
+- **Reactions** under messages, like Discord: the emoji and how many people used it, with the bot's own reactions outlined. Click one to add or remove the bot's reaction, or use the emoji button that appears when you hover a message (or **Add reaction** in the right-click menu) to pick any emoji of any server the bot is in. Counts update live.
 - **Formatting from the message box**: right-click inside it to wrap the selected text in bold, italic, underline, strikethrough, spoiler, code, code block or quote (click again to remove it). `Ctrl+B`, `Ctrl+I` and `Ctrl+U` work too.
 
 **Media**
@@ -32,12 +33,13 @@ A desktop Discord client, written in Rust, where you log in **as a bot** instead
 
 **Profile and voice**
 - A Discord-style profile card to change the bot's own username, avatar, banner and bio.
-- Join a voice channel, talk with your microphone and hear the others (end-to-end encrypted calls are supported). Mute and deafen buttons are in the bar that appears while connected.
+- **Bot status** in the same card: Online, Idle, Do not disturb or Invisible, plus one activity (*Playing*, *Streaming*, *Listening to*, *Watching*, *Competing in*, or a *Custom status* text). It is applied when you click Apply and again every time the bot connects, and it is remembered. A bot can't use the pictures, buttons or timers of a full Rich Presence, and *Streaming* needs a Twitch or YouTube address.
+- **Voice (beta)**: join a voice channel, talk with your microphone and hear the others (end-to-end encrypted calls are supported). Mute and deafen buttons are in the bar that appears while connected. See the limits below: it is not at the quality of the official client yet.
 
 **Make it yours** (the sliders icon at the bottom left)
 - **Themes**: *Dark grey*, *Black*, *Light* and *Midnight* are built in. Edit any of the ten colours live and save the result as your own theme.
 - **Interface size** from 80 % to 150 %.
-- **Icons**: a built-in set of 23 vector icons, tinted with the theme (or a colour you choose), with a size slider, and **icon packs**.
+- **Icons**: a built-in set of 25 vector icons, tinted with the theme (or a colour you choose), with a size slider, and **icon packs**.
 - **Cursor** (experimental): three built-in styles, or your own.
 
 **Private by design**: the token is stored in the Windows credential store (only if you tick the box) and is only ever sent to `discord.com`.
@@ -56,7 +58,7 @@ Everything lives in `%APPDATA%\dbyb`. The settings window has a button that open
 }
 ```
 
-**Icon packs** are folders in `icon-packs\<pack name>`. A file replaces the built-in icon of the same name (`.svg`, `.png`, `.webp`, `.gif` or `.jpg`); the icons you don't provide stay as they are. The names are: `plus`, `smile`, `gif`, `sliders`, `user`, `logout`, `reply`, `copy`, `trash`, `edit`, `close`, `search`, `hash`, `speaker`, `mic`, `mic_off`, `headphones`, `headphones_off`, `leave`, `send`, `message`, `image`, `plus_circle`, `members`. Icons are tinted with the theme colour, so draw them in white.
+**Icon packs** are folders in `icon-packs\<pack name>`. A file replaces the built-in icon of the same name (`.svg`, `.png`, `.webp`, `.gif` or `.jpg`); the icons you don't provide stay as they are. The names are: `plus`, `smile`, `gif`, `sliders`, `user`, `logout`, `reply`, `copy`, `trash`, `edit`, `close`, `search`, `hash`, `speaker`, `mic`, `mic_off`, `headphones`, `headphones_off`, `leave`, `send`, `message`, `image`, `plus_circle`, `members`, `video`, `monitor`. Icons are tinted with the theme colour, so draw them in white.
 
 **Cursors** are folders in `cursors\<style name>` holding `arrow`, `pointer` (over buttons and links) and `text` (over text boxes), as `.svg` or `.png`. The active point is the top-left corner (the centre for `text`). While a custom cursor is on, DBYB hides the Windows cursor in its window and draws the picture itself, so it only exists inside the window and can lag a little.
 
@@ -66,10 +68,10 @@ What a bot can do is decided by Discord, not by this app:
 
 - A bot can't join a server by itself. Someone with the *Manage Server* permission has to add it with the OAuth2 invite link.
 - A bot can't be added to a group DM, and it can only edit and delete its own messages.
-- No video, camera or screen sharing, and no calls in DMs: bots can only use server voice channels.
+- **Voice is still in beta.** You can join a voice channel, talk and listen, but **what you hear from the others can sound unclear or distorted** in DBYB, so don't count on it for important calls yet. Use headphones: the bot's microphone and speakers are on your PC, and without them the sound can loop back into the channel.
+- No video, camera or screen sharing, and no calls in DMs: bots can only use server voice channels. DBYB shows **who** has their camera or screen share on, but a bot can't receive the picture itself: Discord only allows that to real clients.
 - The member list and the statuses need two privileged intents, which you turn on yourself for your own bot.
 - A bot can't see another user's **"About me"** text, **Nitro subscription** (and so its level: Starter to Opal) or **boosts on other servers**. DBYB shows the Nitro badge when someone has an animated picture or a banner (only Nitro allows them), which is a hint and not proof. The boost badge only reflects the boost of the server you are looking at, so it is a minimum.
-- No reactions yet.
 - Changing a bot's username and images is rate-limited by Discord.
 - Windows only for now (the token is stored with the Windows credential store).
 
@@ -77,7 +79,7 @@ What a bot can do is decided by Discord, not by this app:
 
 1. Create an application at the [Discord developer portal](https://discord.com/developers/applications), add a **Bot**, and copy its token.
 2. In the **Bot** page, turn on **Message Content Intent** so the bot can read messages.
-3. Invite the bot to your server with an OAuth2 URL (scope `bot`, with the permissions you want: view channels, send messages, attach files, connect and speak for voice).
+3. Invite the bot to your server with an OAuth2 URL (scope `bot`, with the permissions you want: view channels, send messages, attach files, add reactions, use external emojis, connect and speak for voice). The bot only sees who is in a voice channel if it can view that channel.
 4. Run DBYB and paste the token.
 5. Optional: for GIFs, get a free key at [partner.klipy.com](https://partner.klipy.com) and paste it the first time you open the GIF picker.
 6. Optional: for the member list and statuses, turn on **Server Members Intent** and **Presence Intent** on the **Bot** page of the developer portal, then use the members button at the top right of a server channel (or the settings). If you turn the list on without them, Discord refuses the connection: DBYB notices, turns the list off again and explains.

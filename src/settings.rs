@@ -23,11 +23,13 @@ pub struct Settings {
     pub members: bool,
     /// Whether the member list is shown (the button in the top bar toggles it).
     pub members_panel: bool,
+    /// What the bot shows next to its name (status and activity).
+    pub bot_status: crate::backend::BotStatus,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { theme: crate::theme::DEFAULT_THEME.into(), scale: 1.0, icon_pack: crate::icons::DEFAULT_PACK.into(), icon_size: 20.0, icon_color: None, cursor_style: crate::cursor::SYSTEM.into(), cursor_size: 28.0, members: false, members_panel: true }
+        Self { theme: crate::theme::DEFAULT_THEME.into(), scale: 1.0, icon_pack: crate::icons::DEFAULT_PACK.into(), icon_size: 20.0, icon_color: None, cursor_style: crate::cursor::SYSTEM.into(), cursor_size: 28.0, members: false, members_panel: true, bot_status: crate::backend::BotStatus::default() }
     }
 }
 

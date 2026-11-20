@@ -8,7 +8,7 @@ mod settings;
 mod theme;
 mod voice;
 
-use backend::{Card, Channel, ChannelKind, Command, Emoji, Event, GifItem, Guild, GuildMember, Message, Presence, Profile, Upload};
+use backend::{BotStatus, Card, Channel, ChannelKind, Command, Emoji, EmojiRef, Event, GifItem, Guild, GuildMember, Message, Presence, Profile, Upload};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use eframe::egui::{self, Margin, RichText, Sense, Stroke, vec2};
 use serde::{Deserialize, Serialize};
@@ -69,6 +69,12 @@ fn member_row(ui: &mut egui::Ui, member: &GuildMember) -> bool {
     response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
 }
 
+/// What a click on a reaction (or on "Add reaction") asks for.
+enum ReactAction {
+    Toggle { message: u64, emoji: EmojiRef, add: bool },
+    /// Open the emoji picker to choose a reaction for this message.
+    Pick(u64),
+}
 enum MemberRow {
     Header(String),
     Member(u64),
@@ -127,6 +133,10 @@ struct App {
     member_rows: Vec<MemberRow>,
     members_dirty: bool,
     card: Option<Card>,
+    /// Who is in each voice channel: server -> channel -> people.
+    voice_users: HashMap<u64, HashMap<u64, Vec<backend::VoiceUser>>>,
+    /// The message an emoji picked in the picker is a reaction for (instead of text for the message box).
+    reaction_target: Option<u64>,
     reconnect_needed: bool,
     reconnect_note: Option<String>,
     emoji_open: bool,
@@ -206,6 +216,66 @@ fn pick_image(title: &str) -> Result<Option<Picked>, String> {
 }
 
 /// A round server icon in the left rail, with the white "selected" pill like Discord.
+fn status_name(status: &str) -> &'static str {
+    match status {
+        "idle" => "Idle",
+        "dnd" => "Do not disturb",
+        "invisible" => "Invisible",
+        _ => "Online",
+    }
+}
+
+fn activity_name(kind: &str) -> &'static str {
+    match kind {
+        "playing" => "Playing",
+        "streaming" => "Streaming",
+        "listening" => "Listening to",
+        "watching" => "Watching",
+        "competing" => "Competing in",
+        "custom" => "Custom status",
+        _ => "None",
+    }
+}
+
+/// How the status reads on Discord: "Playing Rust", "Listening to a song"...
+fn status_preview(status: &BotStatus) -> String {
+    let text = status.text.trim();
+    if status.kind == "none" || text.is_empty() {
+        return status_name(&status.status).to_string();
+    }
+    match status.kind.as_str() {
+        "custom" => format!("{}: {text}", status_name(&status.status)),
+        kind => format!("{}: {} {text}", status_name(&status.status), activity_name(kind)),
+    }
+}
+/// Someone in a voice channel, under the channel's name: picture, name, and what they have turned on.
+fn voice_user_row(ui: &mut egui::Ui, user: &backend::VoiceUser) {
+    let width = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(vec2(width, 26.0), Sense::hover());
+    let silenced = user.deafened || user.muted;
+    let reserved = (if user.stream { 36.0 } else { 0.0 }) + (if user.video { 20.0 } else { 0.0 }) + (if silenced { 20.0 } else { 0.0 });
+    let picture = egui::Rect::from_center_size(egui::pos2(rect.left() + 38.0, rect.center().y), vec2(20.0, 20.0));
+    egui::Image::new(user.avatar.clone()).corner_radius(10.0).paint_at(ui, picture);
+    let name_area = egui::Rect::from_min_max(rect.min, egui::pos2(rect.right() - reserved - 4.0, rect.bottom()));
+    ui.painter_at(name_area).text(egui::pos2(picture.right() + 8.0, rect.center().y), egui::Align2::LEFT_CENTER, &user.name, egui::FontId::proportional(13.0), muted());
+
+    // what is turned on, from the right edge
+    let mut x = rect.right() - 12.0;
+    if user.stream {
+        let chip = egui::Rect::from_center_size(egui::pos2(x - 12.0, rect.center().y), vec2(30.0, 14.0));
+        ui.painter().rect_filled(chip, 3.0, egui::Color32::from_rgb(237, 66, 69));
+        ui.painter().text(chip.center(), egui::Align2::CENTER_CENTER, "LIVE", egui::FontId::proportional(9.5), egui::Color32::WHITE);
+        x -= 36.0;
+    }
+    if user.video {
+        icons::paint(ui, Icon::Video, egui::Rect::from_center_size(egui::pos2(x, rect.center().y), vec2(14.0, 14.0)), muted());
+        x -= 20.0;
+    }
+    if silenced {
+        let icon = if user.deafened { Icon::HeadphonesOff } else { Icon::MicOff };
+        icons::paint(ui, icon, egui::Rect::from_center_size(egui::pos2(x, rect.center().y), vec2(14.0, 14.0)), bad());
+    }
+}
 fn server_icon(ui: &mut egui::Ui, selected: bool, icon: Option<&str>, label: &str, glyph: Option<Icon>) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(vec2(48.0, 48.0), Sense::click());
     let active = selected || response.hovered();
@@ -300,6 +370,8 @@ impl App {
             member_rows: Vec::new(),
             members_dirty: false,
             card: None,
+            voice_users: HashMap::new(),
+            reaction_target: None,
             reconnect_needed: false,
             reconnect_note: None,
             emoji_open: false,
@@ -337,6 +409,7 @@ impl App {
             return;
         }
         let members = self.settings.members;
+        let bot_status = self.settings.bot_status.clone();
         let (event_tx, event_rx) = mpsc::channel();
         let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
         let ctx = ctx.clone();
@@ -344,7 +417,7 @@ impl App {
             let events = event_tx.clone();
             let repaint = ctx.clone();
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                backend::run(token, members, command_rx, event_tx, move || ctx.request_repaint())
+                backend::run(token, members, bot_status, command_rx, event_tx, move || ctx.request_repaint())
             }));
             if result.is_err() {
                 let _ = events.send(Event::Error("The connection thread crashed. See the console for details.".into()));
@@ -371,6 +444,7 @@ impl App {
         self.members.clear();
         self.member_rows.clear();
         self.card = None;
+        self.voice_users.clear();
         self.voice = None;
         self.mic_muted = false;
         self.deafened = false;
@@ -518,7 +592,55 @@ impl App {
                         self.members_dirty = true;
                     }
                 }
-                Event::Card(card) => self.card = Some(card),
+                Event::ReactionAdded { channel, message, emoji, mine } => {
+                    if self.selected_channel == Some(channel) {
+                        if let Some(target) = self.messages.iter_mut().find(|m| m.id == message) {
+                            match target.reactions.iter_mut().find(|r| r.emoji.same(&emoji)) {
+                                Some(reaction) => {
+                                    reaction.count += 1;
+                                    reaction.me |= mine;
+                                }
+                                None => target.reactions.push(backend::ReactionInfo { emoji, count: 1, me: mine }),
+                            }
+                        }
+                    }
+                }
+                Event::ReactionRemoved { channel, message, emoji, mine } => {
+                    if self.selected_channel == Some(channel) {
+                        if let Some(target) = self.messages.iter_mut().find(|m| m.id == message) {
+                            if let Some(reaction) = target.reactions.iter_mut().find(|r| r.emoji.same(&emoji)) {
+                                reaction.count = reaction.count.saturating_sub(1);
+                                if mine {
+                                    reaction.me = false;
+                                }
+                            }
+                            target.reactions.retain(|r| r.count > 0);
+                        }
+                    }
+                }
+                Event::ReactionsCleared { channel, message } => {
+                    if self.selected_channel == Some(channel) {
+                        if let Some(target) = self.messages.iter_mut().find(|m| m.id == message) {
+                            target.reactions.clear();
+                        }
+                    }
+                }
+                Event::ReactionEmojiCleared { channel, message, emoji } => {
+                    if self.selected_channel == Some(channel) {
+                        if let Some(target) = self.messages.iter_mut().find(|m| m.id == message) {
+                            target.reactions.retain(|r| !r.emoji.same(&emoji));
+                        }
+                    }
+                }                Event::VoiceChannels { guild, users } => {
+                    let channels = self.voice_users.entry(guild).or_default();
+                    channels.clear();
+                    for (channel, user) in users {
+                        channels.entry(channel).or_default().push(user);
+                    }
+                }
+                Event::VoiceUserChanged { guild, channel, user } => {
+                    backend::apply_voice_change(self.voice_users.entry(guild).or_default(), channel, user);
+                }                Event::Card(card) => self.card = Some(card),
                 Event::PrivilegedIntentsRefused => {
                     self.settings.members = false;
                     self.settings.save();
@@ -600,6 +722,7 @@ impl App {
     fn profile_window(&mut self, ctx: &egui::Context) {
         let mut close = false;
         let mut apply = false;
+        let mut status_changed = false;
         let width = 420.0;
         let dirty = self.profile_name.trim() != self.profile.name || self.profile_bio != self.profile.bio || self.avatar.is_some() || self.banner.is_some();
         let card = egui::Frame::new().fill(sidebar()).corner_radius(12.0).stroke(Stroke::new(1.0, line()));
@@ -664,7 +787,13 @@ impl App {
                     ui.label(RichText::new("Member since").size(12.0).strong());
                     ui.label(messages::format_date(self.profile.created));
                 });
-                ui.label(RichText::new("Discord limits how often a bot can change its username and images.").size(11.0).color(muted()));
+                egui::Frame::new().fill(rail()).corner_radius(8.0).inner_margin(12.0).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(RichText::new("Status").size(12.0).strong());
+                    if self.status_editor(ui) {
+                        status_changed = true;
+                    }
+                });                ui.label(RichText::new("Discord limits how often a bot can change its username and images.").size(11.0).color(muted()));
                 if let Some(error) = &self.error {
                     ui.label(RichText::new(error).color(bad()));
                 }
@@ -679,6 +808,10 @@ impl App {
             });
             ui.add_space(14.0);
         });
+        if status_changed {
+            self.settings.save();
+            self.send(Command::SetStatus(self.settings.bot_status.clone()));
+        }
         if apply {
             let name = self.profile_name.trim().to_string();
             let username = (!name.is_empty() && name != self.profile.name).then_some(name);
@@ -695,8 +828,9 @@ impl App {
     }
     fn emoji_window(&mut self, ctx: &egui::Context) {
         let mut open = self.emoji_open;
-        let mut inserted = None;
-        egui::Window::new("Emojis").open(&mut open).collapsible(false).resizable(false).anchor(egui::Align2::RIGHT_BOTTOM, [-24.0, -84.0]).show(ctx, |ui| {
+        let mut inserted: Option<EmojiRef> = None;
+        let title = if self.reaction_target.is_some() { "Add a reaction" } else { "Emojis" };
+        egui::Window::new(title).open(&mut open).collapsible(false).resizable(false).anchor(egui::Align2::RIGHT_BOTTOM, [-24.0, -84.0]).show(ctx, |ui| {
             ui.set_width(340.0);
             egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
                 for guild in &self.guilds {
@@ -708,8 +842,7 @@ impl App {
                             let image = egui::Image::new(messages::emoji_url(emoji.id)).fit_to_exact_size(vec2(28.0, 28.0));
                             let button = ui.add(egui::Button::image(image).frame(false)).on_hover_text(format!(":{}:", emoji.name));
                             if button.clicked() {
-                                let tag = if emoji.animated { "a" } else { "" };
-                                inserted = Some(format!("<{tag}:{}:{}> ", emoji.name, emoji.id));
+                                inserted = Some(EmojiRef::Custom { id: emoji.id, name: emoji.name.clone(), animated: emoji.animated });
                             }
                         }
                     });
@@ -726,15 +859,30 @@ impl App {
                             symbol.push(chars.next().unwrap_or_default());
                         }
                         if ui.add(egui::Button::new(RichText::new(&symbol).size(20.0)).frame(false)).clicked() {
-                            inserted = Some(symbol);
+                            inserted = Some(EmojiRef::Unicode(symbol));
                         }
                     }
                 });
             });
         });
         self.emoji_open = open;
-        if let Some(text) = inserted {
-            self.input.push_str(&text);
+        if !open {
+            self.reaction_target = None;
+        }
+        if let Some(emoji) = inserted {
+            match (self.reaction_target.take(), self.selected_channel) {
+                (Some(message), Some(channel)) => {
+                    self.send(Command::React { channel, message, emoji, add: true });
+                    self.emoji_open = false;
+                }
+                _ => {
+                    let mut text = emoji.text();
+                    if matches!(emoji, EmojiRef::Custom { .. }) {
+                        text.push(' ');
+                    }
+                    self.input.push_str(&text);
+                }
+            }
         }
     }
 
@@ -987,6 +1135,45 @@ impl App {
         }
     }
 
+    /// The bot's status and activity (what Discord shows next to its name). Returns true when it changed.
+    fn status_editor(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut status_changed = false;
+        egui::ComboBox::from_label("Status").selected_text(status_name(&self.settings.bot_status.status)).show_ui(ui, |ui| {
+            for value in ["online", "idle", "dnd", "invisible"] {
+                if ui.selectable_label(self.settings.bot_status.status == value, status_name(value)).clicked() {
+                    self.settings.bot_status.status = value.to_string();
+                    status_changed = true;
+                }
+            }
+        });
+        egui::ComboBox::from_label("Activity").selected_text(activity_name(&self.settings.bot_status.kind)).show_ui(ui, |ui| {
+            for value in ["none", "playing", "streaming", "listening", "watching", "competing", "custom"] {
+                if ui.selectable_label(self.settings.bot_status.kind == value, activity_name(value)).clicked() {
+                    self.settings.bot_status.kind = value.to_string();
+                    status_changed = true;
+                }
+            }
+        });
+        if self.settings.bot_status.kind != "none" {
+            let hint = if self.settings.bot_status.kind == "custom" { "Status text" } else { "What is the bot doing?" };
+            ui.add(egui::TextEdit::singleline(&mut self.settings.bot_status.text).hint_text(hint).desired_width(f32::INFINITY));
+        }
+        if self.settings.bot_status.kind == "streaming" {
+            ui.add(egui::TextEdit::singleline(&mut self.settings.bot_status.url).hint_text("https://twitch.tv/... or a YouTube address").desired_width(f32::INFINITY));
+            if self.settings.bot_status.url.trim().is_empty() {
+                ui.label(RichText::new("Streaming needs a Twitch or YouTube address, otherwise Discord shows it as Playing.").size(11.0).color(muted()));
+            }
+        }
+        ui.horizontal(|ui| {
+            if ui.button("Apply the status").clicked() {
+                status_changed = true;
+            }
+            ui.label(RichText::new(status_preview(&self.settings.bot_status)).size(12.0).color(muted()));
+        });
+        ui.label(RichText::new("A bot can show a status and one activity, but none of the pictures, buttons or timers of a full Rich Presence.").size(11.0).color(muted()));
+        status_changed
+    }
+
     fn select_theme(&mut self, ctx: &egui::Context, name: &str) {
         if let Some(theme) = self.themes.iter().find(|t| t.name == name).cloned() {
             theme::set(theme.colors);
@@ -1187,6 +1374,14 @@ impl App {
                 if row(ui, connected, Icon::Speaker, &channel.name) {
                     *pick_voice = Some(channel.id);
                 }
+                // who is in the channel, like Discord
+                if let Some(users) = self.selected_guild.and_then(|g| self.voice_users.get(&g)).and_then(|channels| channels.get(&channel.id)) {
+                    let mut sorted: Vec<&backend::VoiceUser> = users.iter().collect();
+                    sorted.sort_by_key(|u| u.name.to_lowercase());
+                    for user in sorted {
+                        voice_user_row(ui, user);
+                    }
+                }
             }
             ChannelKind::Category => {}
         };
@@ -1208,7 +1403,7 @@ impl App {
         }
     }
 
-    fn message_list(&self, ui: &mut egui::Ui, open_dm: &mut Option<u64>, open_card: &mut Option<u64>, reply_to: &mut Option<(u64, String)>, delete: &mut Option<u64>, edit: &mut Option<(u64, String)>) {
+    fn message_list(&self, ui: &mut egui::Ui, open_dm: &mut Option<u64>, open_card: &mut Option<u64>, reply_to: &mut Option<(u64, String)>, delete: &mut Option<u64>, edit: &mut Option<(u64, String)>, react: &mut Option<ReactAction>) {
         for (i, message) in self.messages.iter().enumerate() {
             let previous = i.checked_sub(1).and_then(|p| self.messages.get(p));
             let grouped = messages::continues(previous, message);
@@ -1250,7 +1445,32 @@ impl App {
                         }
                         messages::attachments(ui, &message.attachments);
                         messages::embeds(ui, message);
-                    });
+                        if !message.reactions.is_empty() {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing = vec2(6.0, 4.0);
+                                for reaction in &message.reactions {
+                                    let stroke = if reaction.me { Stroke::new(1.0, muted()) } else { Stroke::NONE };
+                                    let chip = egui::Frame::new().fill(if reaction.me { hover() } else { input() }).stroke(stroke).corner_radius(8.0).inner_margin(Margin::symmetric(8, 3)).show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 5.0;
+                                            match &reaction.emoji {
+                                                EmojiRef::Custom { id, .. } => {
+                                                    ui.add(egui::Image::new(messages::emoji_url(*id)).fit_to_exact_size(vec2(16.0, 16.0)));
+                                                }
+                                                EmojiRef::Unicode(symbol) => {
+                                                    ui.label(RichText::new(symbol).size(15.0));
+                                                }
+                                            }
+                                            ui.label(RichText::new(reaction.count.to_string()).size(12.0).color(if reaction.me { ink() } else { muted() }));
+                                        });
+                                    });
+                                    let click = chip.response.interact(Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+                                    if click.clicked() {
+                                        *react = Some(ReactAction::Toggle { message: message.id, emoji: reaction.emoji.clone(), add: !reaction.me });
+                                    }
+                                }
+                            });
+                        }                    });
                 });
             });
             // the whole line, to the right edge: the pointer stays "on the message" while it moves to the button
@@ -1258,12 +1478,20 @@ impl App {
             // a "Reply" button appears at the right of the message under the pointer
             if ui.rect_contains_pointer(line) {
                 let button = egui::Rect::from_min_size(egui::pos2(line.right() - 40.0, line.top()), vec2(34.0, 34.0));
+                let mut react_corner = ui.new_child(egui::UiBuilder::new().max_rect(button.translate(vec2(-36.0, 0.0))));
+                if icons::button(&mut react_corner, Icon::Smile, "Add a reaction").clicked() {
+                    *react = Some(ReactAction::Pick(message.id));
+                }
                 let mut corner = ui.new_child(egui::UiBuilder::new().max_rect(button));
                 if icons::button(&mut corner, Icon::Reply, "Reply").clicked() {
                     *reply_to = Some((message.id, message.author.clone()));
                 }
             }
             row.response.context_menu(|ui| {
+                if icons::menu_item(ui, Icon::Smile, "Add reaction").clicked() {
+                    *react = Some(ReactAction::Pick(message.id));
+                    ui.close();
+                }
                 if icons::menu_item(ui, Icon::Reply, "Reply").clicked() {
                     *reply_to = Some((message.id, message.author.clone()));
                     ui.close();
@@ -1309,6 +1537,7 @@ impl App {
         let mut voice_action = None;
         let mut open_dm = None;
         let mut open_card: Option<u64> = None;
+        let mut react: Option<ReactAction> = None;
         let mut members_toggle = false;
         let mut logout = false;
         let mut open_profile = false;
@@ -1547,6 +1776,7 @@ impl App {
                             response.request_focus();
                         }
                         if icons::button(ui, Icon::Smile, "Emojis").clicked() {
+                            self.reaction_target = None;
                             self.emoji_open = !self.emoji_open;
                             self.gif_open = false;
                         }
@@ -1566,7 +1796,7 @@ impl App {
 
         egui::CentralPanel::no_frame().frame(panel(bg(), Margin::symmetric(16, 8))).show(ui, |ui| {
             egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
-                self.message_list(ui, &mut open_dm, &mut open_card, &mut new_reply, &mut delete_id, &mut new_edit);
+                self.message_list(ui, &mut open_dm, &mut open_card, &mut new_reply, &mut delete_id, &mut new_edit, &mut react);
             });
         });
 
@@ -1648,7 +1878,19 @@ impl App {
             }
             self.settings.save();
         }
-        if let Some(user) = open_card {
+        match react {
+            Some(ReactAction::Toggle { message, emoji, add }) => {
+                if let Some(channel) = self.selected_channel {
+                    self.send(Command::React { channel, message, emoji, add });
+                }
+            }
+            Some(ReactAction::Pick(message)) => {
+                self.reaction_target = Some(message);
+                self.emoji_open = true;
+                self.gif_open = false;
+            }
+            None => {}
+        }        if let Some(user) = open_card {
             self.card = None;
             let guild = if self.dm_mode { None } else { self.selected_guild };
             self.send(Command::LoadCard { guild, user });
