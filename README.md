@@ -38,8 +38,8 @@ What a bot can do is decided by Discord, not by this app:
 You need [Rust](https://rustup.rs), the MSVC build tools and [CMake](https://cmake.org/download/) (Opus, the voice codec, is built from source).
 
 ```powershell
-git clone https://github.com/plagieur/dbyb.git
-cd dbyb
+git clone https://github.com/plagieur/dbyd.git
+cd dbyd
 cargo build --release
 ```
 
