@@ -15,6 +15,7 @@ eframe = "0.37.0"
 egui_extras = { version = "0.37", features = ["http", "image", "all_loaders"] }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 keyring = { version = "3", features = ["windows-native"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls-no-provider"] }
 rfd = "0.18"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0.229", features = ["derive"] }

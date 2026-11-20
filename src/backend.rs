@@ -15,7 +15,7 @@ use twilight_gateway::{Event as GatewayEvent, EventTypeFlags, Intents, Shard, Sh
 use twilight_http::Client;
 use twilight_model::channel::ChannelType;
 use twilight_model::http::attachment::Attachment as UploadAttachment;
-use twilight_model::id::{Id, marker::{ChannelMarker, GuildMarker, UserMarker}};
+use twilight_model::id::{Id, marker::{ChannelMarker, GuildMarker, MessageMarker, UserMarker}};
 use twilight_model::util::ImageHash;
 
 #[derive(Clone)]
@@ -53,6 +53,10 @@ pub struct Attachment {
 
 #[derive(Clone)]
 pub struct Embed {
+    /// "rich", "image", "gifv" (Tenor, Giphy...), "video", "link"...
+    pub kind: String,
+    pub url: Option<String>,
+    pub video: Option<String>,
     pub title: Option<String>,
     pub description: Option<String>,
     pub color: Option<u32>,
@@ -74,7 +78,11 @@ pub struct Message {
     pub avatar: String,
     pub bot: bool,
     pub content: String,
+    /// People mentioned in the message (`<@id>` in the text), to show `@name`.
+    pub mentions: Vec<(u64, String)>,
     pub timestamp: i64,
+    /// The message was edited after it was sent.
+    pub edited: bool,
     pub reply: Option<Reply>,
     pub attachments: Vec<Attachment>,
     pub embeds: Vec<Embed>,
@@ -87,6 +95,55 @@ pub struct Emoji {
     pub animated: bool,
 }
 
+/// A GIF from Klipy: a small preview for the picker, and the address that gets sent in the message.
+#[derive(Clone)]
+pub struct GifItem {
+    pub slug: String,
+    pub title: String,
+    pub preview: String,
+    pub width: u32,
+    pub height: u32,
+    pub send_url: String,
+}
+
+/// Asks Klipy for trending GIFs (empty query) or search results. The key is part of the address, so errors never show it.
+async fn klipy_gifs(web: &reqwest::Client, key: &str, query: &str) -> Result<Vec<GifItem>, String> {
+    let kind = if query.is_empty() { "trending" } else { "search" };
+    let mut request = web.get(format!("https://api.klipy.com/api/v1/{key}/gifs/{kind}")).query(&[("page", "1"), ("per_page", "24")]);
+    if !query.is_empty() {
+        request = request.query(&[("q", query)]);
+    }
+    let response = request.send().await.map_err(|e| format!("Cannot reach Klipy: {}", e.without_url()))?;
+    let status = response.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN || status == reqwest::StatusCode::NOT_FOUND {
+        return Err("Klipy refused the API key. Check it in the GIF picker.".into());
+    }
+    if !status.is_success() {
+        return Err(format!("Klipy answered {status}."));
+    }
+    let body: serde_json::Value = response.json().await.map_err(|e| format!("Unreadable answer from Klipy: {}", e.without_url()))?;
+    let list = body["data"]["data"].as_array().cloned().unwrap_or_default();
+    Ok(list
+        .iter()
+        .filter(|item| item["type"].as_str().is_none_or(|t| t != "ad"))
+        .filter_map(|item| {
+            let slug = item["slug"].as_str()?.to_string();
+            let file = &item["file"];
+            let preview = ["xs", "sm", "md"].iter().find_map(|size: &&str| file[*size]["gif"]["url"].as_str())?;
+            let sent = ["md", "sm", "hd"].iter().find_map(|size: &&str| file[*size]["gif"]["url"].as_str())?;
+            let dims = &file["xs"]["gif"];
+            Some(GifItem {
+                slug,
+                title: item["title"].as_str().unwrap_or_default().to_string(),
+                preview: preview.to_string(),
+                width: dims["width"].as_u64().unwrap_or(200) as u32,
+                height: dims["height"].as_u64().unwrap_or(150) as u32,
+                send_url: sent.to_string(),
+            })
+        })
+        .collect())
+}
+
 pub struct Upload {
     pub name: String,
     pub bytes: Vec<u8>,
@@ -96,8 +153,14 @@ pub enum Command {
     LoadChannels(u64),
     LoadEmojis(u64),
     LoadMessages(u64),
-    Send { channel: u64, text: String, files: Vec<Upload> },
+    Send { channel: u64, text: String, files: Vec<Upload>, reply_to: Option<u64> },
     OpenDm(u64),
+    DeleteMessage { channel: u64, id: u64 },
+    EditMessage { channel: u64, id: u64, text: String },
+    /// Trending GIFs when `query` is empty, search results otherwise.
+    Gifs { key: String, query: String },
+    /// Tells Klipy a GIF was sent (their usage rules ask for it).
+    GifShared { key: String, slug: String },
     JoinVoice { guild: u64, channel: u64 },
     LeaveVoice,
     SetMicMuted(bool),
@@ -109,10 +172,14 @@ pub enum Event {
     LoggedIn { profile: Profile, guilds: Vec<Guild> },
     Channels { guild: u64, channels: Vec<Channel> },
     Emojis { guild: u64, emojis: Vec<Emoji> },
+    Gifs { query: String, items: Vec<GifItem> },
     Messages { channel: u64, messages: Vec<Message> },
     /// `is_dm` is true when the message was sent in a direct message channel.
     NewMessage { channel: u64, message: Message, is_dm: bool },
-    DmOpened { channel: u64, user_id: u64, name: String },
+    /// A message changed: most often Discord adding the preview (embed) of a link a moment after it was sent.
+    MessageUpdated { channel: u64, message: Message },
+    DmOpened { channel: u64, user_id: u64, name: String, avatar: String },
+    MessageDeleted { channel: u64, id: u64 },
     ProfileUpdated(Profile),
     /// The voice channel the bot is connected to (guild, channel), or `None` once it left.
     Voice(Option<(u64, u64)>),
@@ -216,7 +283,9 @@ fn convert(m: &twilight_model::channel::Message) -> Message {
         avatar: avatar_url(m.author.id, m.author.avatar.as_ref(), 64),
         bot: m.author.bot,
         content: m.content.clone(),
+        mentions: m.mentions.iter().map(|u| (u.id.get(), u.name.clone())).collect(),
         timestamp: m.timestamp.as_secs(),
+        edited: m.edited_timestamp.is_some(),
         reply: m.referenced_message.as_ref().map(|r| Reply { author: r.author.name.clone(), content: r.content.clone() }),
         attachments: m
             .attachments
@@ -234,6 +303,9 @@ fn convert(m: &twilight_model::channel::Message) -> Message {
             .embeds
             .iter()
             .map(|e| Embed {
+                kind: e.kind.clone(),
+                url: e.url.clone(),
+                video: e.video.as_ref().and_then(|v| v.url.clone()),
                 title: e.title.clone(),
                 description: e.description.clone(),
                 color: e.color,
@@ -294,18 +366,30 @@ pub fn run(token: String, commands: UnboundedReceiver<Command>, events: Sender<E
         let live = {
             let (events, repaint, songbird) = (events.clone(), repaint.clone(), songbird.clone());
             tokio::spawn(async move {
-                let wanted = EventTypeFlags::MESSAGE_CREATE | EventTypeFlags::VOICE_STATE_UPDATE | EventTypeFlags::VOICE_SERVER_UPDATE;
+                let wanted = EventTypeFlags::MESSAGE_CREATE | EventTypeFlags::MESSAGE_UPDATE | EventTypeFlags::MESSAGE_DELETE | EventTypeFlags::VOICE_STATE_UPDATE | EventTypeFlags::VOICE_SERVER_UPDATE;
                 while let Some(item) = shard.next_event(wanted).await {
                     let Ok(event) = item else { continue };
                     songbird.process(&event).await;
-                    if let GatewayEvent::MessageCreate(m) = event {
-                        let _ = events.send(Event::NewMessage { channel: m.channel_id.get(), message: convert(&m), is_dm: m.guild_id.is_none() });
-                        repaint();
+                    match event {
+                        GatewayEvent::MessageCreate(m) => {
+                            let _ = events.send(Event::NewMessage { channel: m.channel_id.get(), message: convert(&m), is_dm: m.guild_id.is_none() });
+                            repaint();
+                        }
+                        GatewayEvent::MessageDelete(m) => {
+                            let _ = events.send(Event::MessageDeleted { channel: m.channel_id.get(), id: m.id.get() });
+                            repaint();
+                        }
+                        GatewayEvent::MessageUpdate(m) => {
+                            let _ = events.send(Event::MessageUpdated { channel: m.channel_id.get(), message: convert(&m) });
+                            repaint();
+                        }
+                        _ => {}
                     }
                 }
             })
         };
         let mut voice: Option<VoiceSession> = None;
+        let web = reqwest::Client::builder().timeout(std::time::Duration::from_secs(15)).user_agent("DBYB").build().expect("HTTP client");
 
         let handle_commands = async {
             let mut commands = commands;
@@ -365,7 +449,7 @@ pub fn run(token: String, commands: UnboundedReceiver<Command>, events: Sender<E
                             Err(e) => send(Event::Error(format!("Cannot read this channel: {e}"))),
                         }
                     }
-                    Command::Send { channel, text, files } => {
+                    Command::Send { channel, text, files, reply_to } => {
                         let Some(cid) = id(channel) else { continue };
                         let uploads: Vec<UploadAttachment> =
                             files.into_iter().enumerate().map(|(i, f)| UploadAttachment::from_bytes(safe_filename(&f.name), f.bytes, i as u64)).collect();
@@ -376,9 +460,24 @@ pub fn run(token: String, commands: UnboundedReceiver<Command>, events: Sender<E
                         if !uploads.is_empty() {
                             request = request.attachments(&uploads);
                         }
+                        if let Some(message) = reply_to.and_then(id::<MessageMarker>) {
+                            request = request.reply(message);
+                        }
                         if let Err(e) = request.await {
                             send(Event::Error(format!("Message not sent: {e}")));
                         }
+                    }
+                    Command::Gifs { key, query } => match klipy_gifs(&web, &key, &query).await {
+                        Ok(items) => send(Event::Gifs { query, items }),
+                        Err(e) => send(Event::Error(e)),
+                    },
+                    Command::GifShared { key, slug } => {
+                        // best effort: nothing to tell the user if it fails
+                        let _ = web
+                            .post(format!("https://api.klipy.com/api/v1/{key}/gifs/share/{slug}"))
+                            .json(&serde_json::json!({ "customer_id": format!("dbyb-{profile_id}") }))
+                            .send()
+                            .await;
                     }
                     Command::JoinVoice { guild, channel } => {
                         let (Some(gid), Some(cid)) = (id::<GuildMarker>(guild), id::<ChannelMarker>(channel)) else { continue };
@@ -439,6 +538,20 @@ pub fn run(token: String, commands: UnboundedReceiver<Command>, events: Sender<E
                             }
                         }
                     }
+                    Command::EditMessage { channel, id: message, text } => {
+                        if let (Some(cid), Some(mid)) = (id::<ChannelMarker>(channel), id::<MessageMarker>(message)) {
+                            if let Err(e) = http.update_message(cid, mid).content(Some(&text)).await {
+                                send(Event::Error(format!("Message not edited: {e}")));
+                            }
+                        }
+                    }
+                    Command::DeleteMessage { channel, id: message } => {
+                        if let (Some(cid), Some(mid)) = (id::<ChannelMarker>(channel), id::<MessageMarker>(message)) {
+                            if let Err(e) = http.delete_message(cid, mid).await {
+                                send(Event::Error(format!("Message not deleted: {e}")));
+                            }
+                        }
+                    }
                     Command::OpenDm(user) => {
                         let Some(uid) = id(user) else {
                             send(Event::Error("That is not a valid user ID.".into()));
@@ -447,8 +560,10 @@ pub fn run(token: String, commands: UnboundedReceiver<Command>, events: Sender<E
                         match http.create_private_channel(uid).await {
                             Ok(r) => match r.model().await {
                                 Ok(channel) => {
-                                    let name = channel.recipients.and_then(|r| r.into_iter().next()).map(|u| u.name).unwrap_or_else(|| user.to_string());
-                                    send(Event::DmOpened { channel: channel.id.get(), user_id: user, name });
+                                    let other = channel.recipients.and_then(|r| r.into_iter().next());
+                                    let avatar = other.as_ref().map(|u| avatar_url(u.id, u.avatar.as_ref(), 64)).unwrap_or_else(|| format!("https://cdn.discordapp.com/embed/avatars/{}.png", (user >> 22) % 6));
+                                    let name = other.map(|u| u.name).unwrap_or_else(|| user.to_string());
+                                    send(Event::DmOpened { channel: channel.id.get(), user_id: user, name, avatar });
                                 }
                                 Err(e) => send(Event::Error(short(e))),
                             },
