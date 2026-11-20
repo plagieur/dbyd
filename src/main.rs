@@ -437,7 +437,8 @@ impl App {
                     Err(e) => self.error = Some(e),
                 }
             }
-            if ui.put(egui::Rect::from_min_size(banner_rect.right_top() + vec2(-36.0, 8.0), vec2(28.0, 28.0)), egui::Button::new("✕").corner_radius(14.0)).clicked() {
+            // `place` leaves the layout cursor alone (`put` would move it back up to the banner's top)
+            if ui.place(egui::Rect::from_min_size(banner_rect.right_top() + vec2(-36.0, 8.0), vec2(28.0, 28.0)), egui::Button::new("✕").corner_radius(14.0)).clicked() {
                 close = true;
             }
 
